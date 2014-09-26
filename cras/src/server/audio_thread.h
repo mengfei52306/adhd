@@ -61,6 +61,7 @@ struct audio_thread {
 	int started;
 	struct active_dev *active_devs[CRAS_NUM_DIRECTIONS];
 	struct active_dev *fallback_devs[CRAS_NUM_DIRECTIONS];
+	struct active_dev *master_adev[CRAS_NUM_DIRECTIONS];
 };
 
 /* Callback function to be handled in main loop in audio thread.

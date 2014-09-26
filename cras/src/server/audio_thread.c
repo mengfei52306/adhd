@@ -563,6 +563,24 @@ static void move_streams_to_added_dev(struct audio_thread *thread,
 		fill_odev_zeros(added_dev, added_dev->min_cb_level);
 }
 
+static void update_master_dev(struct audio_thread *thread,
+			      enum CRAS_STREAM_DIRECTION dir)
+{
+	struct active_dev *adev;
+	struct cras_ionode *node;
+
+	thread->master_adev[dir] = thread->active_devs[dir];
+	DL_FOREACH(thread->active_devs[dir], adev) {
+		DL_FOREACH(adev->dev->nodes, node) {
+			if (node->type == CRAS_NODE_TYPE_INTERNAL_SPEAKER ||
+			    node->type == CRAS_NODE_TYPE_HEADPHONE ||
+			    node->type == CRAS_NODE_TYPE_INTERNAL_MIC ||
+			    node->type == CRAS_NODE_TYPE_MIC)
+				thread->master_adev[dir] = adev;
+		}
+	}
+}
+
 /* Handles messages from main thread to add a new active device. */
 static void thread_add_active_dev(struct audio_thread *thread,
 				  struct cras_iodev *iodev)
@@ -588,6 +606,7 @@ static void thread_add_active_dev(struct audio_thread *thread,
 	move_streams_to_added_dev(thread, adev);
 
 	DL_APPEND(thread->active_devs[iodev->direction], adev);
+	update_master_dev(thread, iodev->direction);
 }
 
 static void thread_rm_active_adev(struct audio_thread *thread,
@@ -611,6 +630,7 @@ static void thread_rm_active_adev(struct audio_thread *thread,
 		DL_APPEND(thread->active_devs[dir], fallback_dev);
 		fallback_dev->dev->is_active = 1;
 	}
+	update_master_dev(thread, dir);
 
 	DL_FOREACH(adev->streams, dev_stream) {
 		if (last_device)
@@ -1238,10 +1258,19 @@ static int wait_pending_output_streams(struct audio_thread *thread)
 }
 
 /* Configure the linear resample of adev. */
-static void config_linear_resampler(struct active_dev *adev)
+static void config_linear_resampler(struct active_dev *master_adev,
+				    struct active_dev *adev)
 {
 	struct cras_iodev *dev = adev->dev;
-	unsigned int new_rate = (unsigned int)cras_iodev_get_est_rate(dev);
+	unsigned int new_rate;
+
+	/* No SRC for master dev. */
+	if (master_adev == adev)
+		return;
+
+	new_rate = cras_iodev_get_est_rate(dev) *
+			master_adev->dev->format->frame_rate /
+			cras_iodev_get_est_rate(master_adev->dev);
 
 	if (new_rate != dev->format->frame_rate) {
 		if (adev->lr) {
@@ -1261,7 +1290,8 @@ static void config_linear_resampler(struct active_dev *adev)
 	}
 }
 
-static int write_output_samples(struct active_dev *adev,
+static int write_output_samples(struct active_dev *master_adev,
+				struct active_dev *adev,
 				struct cras_iodev *loop_dev)
 {
 	struct cras_iodev *odev = adev->dev;
@@ -1291,7 +1321,7 @@ static int write_output_samples(struct active_dev *adev,
 	frame_bytes = cras_get_format_bytes(odev->format);
 
 	if (cras_iodev_update_rate(odev, hw_level))
-		config_linear_resampler(adev);
+		config_linear_resampler(master_adev, adev);
 
 	audio_thread_event_log_data(atlog, AUDIO_THREAD_FILL_AUDIO,
 				    adev->dev->info.idx, hw_level, 0);
@@ -1382,7 +1412,8 @@ static int do_playback(struct audio_thread *thread)
 	DL_FOREACH(odev_list, adev) {
 		if (!device_open(adev->dev))
 			continue;
-		write_output_samples(adev, first_loop_dev(thread));
+		write_output_samples(thread->master_adev[CRAS_STREAM_OUTPUT],
+				     adev, first_loop_dev(thread));
 	}
 
 	/* TODO(dgreid) - once per rstream, not once per dev_stream. */
@@ -1441,7 +1472,8 @@ static unsigned int get_stream_limit_set_delay(struct active_dev *adev,
  *      case the first read.
  * Returns 0 on success.
  */
-static int capture_to_streams(struct active_dev *adev,
+static int capture_to_streams(struct active_dev *master_adev,
+			      struct active_dev *adev,
 			      unsigned int dev_index)
 {
 	struct cras_iodev *idev = adev->dev;
@@ -1450,7 +1482,7 @@ static int capture_to_streams(struct active_dev *adev,
 
 	hw_level = idev->frames_queued(idev);
 	if (cras_iodev_update_rate(idev, hw_level))
-		config_linear_resampler(adev);
+		config_linear_resampler(master_adev, adev);
 
 	remainder = MIN(hw_level, get_stream_limit_set_delay(adev, hw_level));
 
@@ -1512,7 +1544,7 @@ static int do_capture(struct audio_thread *thread)
 	DL_FOREACH(idev_list, adev) {
 		if (!device_open(adev->dev))
 			continue;
-		capture_to_streams(adev, dev_index);
+		capture_to_streams(thread->master_adev[CRAS_STREAM_INPUT], adev, dev_index);
 		dev_index++;
 	}
 
