@@ -281,4 +281,18 @@ static inline int cras_iodev_software_volume_needed(
 /* Gets the software volume scaler of the iodev. The scaler should only be
  * applied if the device needs software volume. */
 float cras_iodev_get_software_volume_scaler(struct cras_iodev *iodev);
+
+/* Marks a buffer from get_buffer as read/written. */
+int cras_iodev_put_buffer(struct cras_iodev *iodev, unsigned int nframes);
+
+/* Returns a buffer to read/write to/from.
+ * Args:
+ *    iodev - The device.
+ *    area - Filled with a pointer to the audio to read/write.
+ *    frames - Filled with the number of frames that can be read/written.
+ */
+int cras_iodev_get_buffer(struct cras_iodev *iodev,
+			  struct cras_audio_area **area,
+			  unsigned *frames);
+
 #endif /* CRAS_IODEV_H_ */
