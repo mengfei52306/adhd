@@ -13,13 +13,11 @@
 #include "cras_audio_area.h"
 #include "cras_iodev.h"
 #include "cras_iodev_list.h"
-#include "cras_rstream.h"
 #include "cras_system_state.h"
 #include "cras_util.h"
-#include "audio_thread.h"
-#include "utlist.h"
 #include "rate_estimator.h"
 #include "softvol_curve.h"
+#include "utlist.h"
 
 static const struct timespec rate_estimation_window_sz = {
 	1, 0 /* 1 sec. */
@@ -125,7 +123,6 @@ int cras_iodev_set_format(struct cras_iodev *iodev,
 				goto error;
 			}
 		}
-
 
 		actual_rate = get_best_rate(iodev, fmt->frame_rate);
 		actual_num_channels = get_best_channel_count(iodev,
