@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "cras_types.h"
+#include "linear_resampler.h"
 
 struct cras_iodev;
 struct cras_rstream;
@@ -26,6 +27,8 @@ enum error_type_from_audio_thread_h {
 /* List of active input/output devices.
  *    dev - The device.
  *    streams - List of audio streams serviced by dev.
+ *    lr - Linear resampler used to correct samples to device's estimated rate.
+ *    resample_buf - Intermediate buffer used for SRC.
  */
 struct active_dev {
 	struct cras_iodev *dev;
@@ -34,6 +37,8 @@ struct active_dev {
 	unsigned int min_cb_level;
 	unsigned int max_cb_level;
 	int speed_adjust;
+	struct linear_resampler *lr;
+	uint8_t *resample_buf;
 	struct active_dev *prev, *next;
 };
 

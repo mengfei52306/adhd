@@ -29,6 +29,7 @@
 #define MIN_PROCESS_TIME_US 500 /* 0.5ms - min amount of time to mix/src. */
 #define SLEEP_FUZZ_FRAMES 10 /* # to consider "close enough" to sleep frames. */
 #define MIN_READ_WAIT_US 2000 /* 2ms */
+#define RESAMPLE_BUF_SIZE 16384
 static const struct timespec playback_wake_fuzz_ts = {
 	0, 500 * 1000 /* 500 usec. */
 };
@@ -577,6 +578,7 @@ static void thread_add_active_dev(struct audio_thread *thread,
 	}
 	adev = (struct active_dev *)calloc(1, sizeof(*adev));
 	adev->dev = iodev;
+	adev->resample_buf = malloc(RESAMPLE_BUF_SIZE);
 	iodev->is_active = 1;
 
 	audio_thread_event_log_data(atlog,
@@ -617,6 +619,7 @@ static void thread_rm_active_adev(struct audio_thread *thread,
 		dev_stream_destroy(dev_stream);
 	}
 
+	free(adev->resample_buf);
 	free(adev);
 }
 
@@ -1234,17 +1237,42 @@ static int wait_pending_output_streams(struct audio_thread *thread)
 	return 0;
 }
 
+/* Configure the linear resample of adev. */
+static void config_linear_resampler(struct active_dev *adev)
+{
+	struct cras_iodev *dev = adev->dev;
+	unsigned int new_rate = (unsigned int)cras_iodev_get_est_rate(dev);
+
+	if (new_rate != dev->format->frame_rate) {
+		if (adev->lr) {
+			linear_resampler_set_rates(adev->lr,
+						   dev->format->frame_rate,
+						   new_rate);
+		} else {
+			adev->lr = linear_resampler_create(
+					dev->format->num_channels,
+					cras_get_format_bytes(dev->format),
+					dev->format->frame_rate,
+					new_rate);
+		}
+	} else if (adev->lr) {
+		linear_resampler_destroy(adev->lr);
+		adev->lr = NULL;
+	}
+}
+
 static int write_output_samples(struct active_dev *adev,
 				struct cras_iodev *loop_dev)
 {
 	struct cras_iodev *odev = adev->dev;
 	unsigned int hw_level;
-	unsigned int frames, fr_to_req;
+	unsigned int frames, fr_to_req, write_limit;
 	snd_pcm_sframes_t written;
 	snd_pcm_uframes_t total_written = 0;
 	int rc;
 	uint8_t *dst = NULL;
 	struct cras_audio_area *area;
+	unsigned int frame_bytes;
 
 	if (odev->is_draining)
 		return drain_output_buffer(adev);
@@ -1259,6 +1287,11 @@ static int write_output_samples(struct active_dev *adev,
 		adev->speed_adjust = -1;
 	else
 		adev->speed_adjust = 0;
+
+	frame_bytes = cras_get_format_bytes(odev->format);
+
+	if (cras_iodev_update_rate(odev, hw_level))
+		config_linear_resampler(adev);
 
 	audio_thread_event_log_data(atlog, AUDIO_THREAD_FILL_AUDIO,
 				    adev->dev->info.idx, hw_level, 0);
@@ -1275,11 +1308,23 @@ static int write_output_samples(struct active_dev *adev,
 		if (rc < 0)
 			return rc;
 
+		write_limit = frames;
+
 		/* TODO(dgreid) - This assumes interleaved audio. */
-		dst = area->channels[0].buf;
-		written = write_streams(adev,
-					dst,
-					frames);
+		if (adev->lr) {
+			unsigned int est_rate = cras_iodev_get_est_rate(odev);
+			frames = MIN(frames, RESAMPLE_BUF_SIZE / frame_bytes);
+			dst = adev->resample_buf;
+			/* Take the estimated rate difference into account when
+			 * determining the write_limit. */
+			if (est_rate > odev->format->frame_rate)
+				write_limit = write_limit *
+					odev->format->frame_rate / est_rate;
+		} else {
+			dst = area->channels[0].buf;
+		}
+
+		written = write_streams(adev, dst, write_limit);
 		if (written < 0) /* pcm has been closed */
 			return (int)written;
 
@@ -1290,13 +1335,10 @@ static int write_output_samples(struct active_dev *adev,
 
 		//loopback_iodev_add_audio(loop_dev, dst, written);
 
-		if (cras_system_get_mute()) {
-			unsigned int frame_bytes;
-			frame_bytes = cras_get_format_bytes(odev->format);
+		if (cras_system_get_mute())
 			cras_mix_mute_buffer(dst, frame_bytes, written);
-		} else {
+		else
 			apply_dsp(odev, dst, written);
-		}
 
 		if (cras_iodev_software_volume_needed(odev)) {
 			cras_scale_buffer((int16_t *)dst,
@@ -1304,10 +1346,17 @@ static int write_output_samples(struct active_dev *adev,
 					  cras_iodev_get_software_volume_scaler(
 							odev));
 		}
+		if (adev->lr && written > 0) {
+			unsigned int in_count = written;
+			written = linear_resampler_resample(
+					adev->lr, dst, &in_count,
+					area->channels[0].buf, frames);
+		}
 
 		rc = cras_iodev_put_buffer(odev, written);
 		if (rc < 0)
 			return rc;
+
 		total_written += written;
 	}
 
@@ -1400,6 +1449,9 @@ static int capture_to_streams(struct active_dev *adev,
 	snd_pcm_uframes_t remainder, hw_level;
 
 	hw_level = idev->frames_queued(idev);
+	if (cras_iodev_update_rate(idev, hw_level))
+		config_linear_resampler(adev);
+
 	remainder = MIN(hw_level, get_stream_limit_set_delay(adev, hw_level));
 
 	audio_thread_event_log_data(atlog, AUDIO_THREAD_READ_AUDIO,
@@ -1427,6 +1479,15 @@ static int capture_to_streams(struct active_dev *adev,
 			cras_mix_mute_buffer(hw_buffer, frame_bytes, nread);
 		else
 			apply_dsp(idev, hw_buffer, nread);
+
+		if (adev->lr && nread > 0) {
+			area = idev->area;
+			area->frames = linear_resampler_resample(adev->lr,
+					hw_buffer, &nread, adev->resample_buf,
+					RESAMPLE_BUF_SIZE / frame_bytes);
+			cras_audio_area_config_buf_pointers(area, idev->format,
+							    adev->resample_buf);
+		}
 
 		DL_FOREACH(adev->streams, stream)
 			dev_stream_capture(stream, area, dev_index);
